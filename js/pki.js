@@ -1021,6 +1021,142 @@ pki.pemToDer = function(pem) {
   return rval;
 };
 
+var _opensslPemRegex = new RegExp(
+  '-----BEGIN [^-]+-----\n+Proc-Type: 4,ENCRYPTED\n+DEK-Info: ([A-Za-z0-9\\-]+),([A-Za-z0-9]+)\n+([A-Za-z0-9+\/=\\s]+)-----END [^-]+-----');
+
+var _setAlgorithmSettings = function(alg) {
+  switch(alg) {
+    case 'DES-EDE3-CBC':
+      return {
+        cipherFn: forge.des.startDecrypting,
+        keyLength: 24,
+        ivLength: 8
+      };
+    case 'AES-128-CBC':
+      return {
+        cipherFn: forge.aes.startDecrypting,
+        keyLength: 16,
+        ivLength: 16
+      };
+    case 'AES-192-CBC':
+      return {
+        cipherFn: forge.aes.startDecrypting,
+        keyLength: 24,
+        ivLength: 16
+      };
+    case 'AES-256-CBC':
+      return {
+        cipherFn: forge.aes.startDecrypting,
+        keyLength: 32,
+        ivLength: 16
+      };
+    case 'DES-CBC':
+      return {
+        cipherFn: forge.des.startDecrypting,
+        keyLength: 8,
+        ivLength: 8
+      };
+    default:
+      throw {
+        message: 'Unsupported encryption.',
+        alg: alg
+      };
+  }
+}
+
+var _setIV = function(s, algSettings) {
+  var len = s.length / 2;
+  if (len != algSettings.ivLength) {
+    throw {
+        message: 'Expected IV length.',
+        length: len,
+        ivLength: algSettings.ivLength,
+    };
+  }
+  var iv = forge.util.createBuffer();
+  for (var j=0; j<len; j++) {
+      iv.putInt(parseInt(s.substring(j*2, j*2 + 2), 16));
+  }        
+  return iv;
+}
+
+var _getSecretKey = function(pwd, iv, algSettings) {
+  if(pwd.constructor != String) {
+    pwd = pwd.data;
+  }
+  if(iv.constructor != String) {
+    iv = iv.data;
+  }
+
+  var key = forge.util.createBuffer();
+  var offset = 0;
+  var bytesNeeded = algSettings.keyLength;
+
+  var md5 = forge.md.md5.create();
+  for (;;) {
+      md5.update(pwd);
+      md5.update(iv);
+      
+      var b = md5.digest();
+
+      var len = (bytesNeeded > b.length()) ? b.length() : bytesNeeded;
+      
+      key.putBytes(b.data);
+
+      offset += len;
+      
+      // check if we need any more
+      bytesNeeded = algSettings.keyLength - offset;
+      if (bytesNeeded == 0) {
+          break;
+      }
+
+      // do another round
+      md5 = forge.md.md5.create();
+      md5.update(b.data);
+  }
+  
+  return key;
+}
+
+/**
+ * Converts OpenSSL PEM-formatted data to DER.
+ *
+ * @param pem the PEM-formatted data.
+ * @param password the password for parivate key.
+ *
+ * @return the DER-formatted data.
+ */
+pki.opensslPemToDer = function(pem, password) {
+  var rval = null;
+
+  // get matching base64
+  var m = _pemRegex.exec(pem);
+  if(m) {
+    return pki.pemToDer(pem);
+  }
+
+  m = _opensslPemRegex.exec(pem);
+  if(m) {
+    var algSettings = _setAlgorithmSettings(m[1]);
+    var iv = _setIV(m[2], algSettings);
+    var keyData = forge.util.decode64(m[3]);
+    
+    var key = _getSecretKey(password, iv, algSettings);
+    var cipher = algSettings.cipherFn(key, iv);
+    var encrypted = forge.util.createBuffer(keyData);
+    cipher.update(encrypted);
+    if(cipher.finish()) {
+      rval = cipher.output;
+    }
+  }
+  else {
+    throw 'Invalid PEM format';
+  }
+
+  return rval;
+};
+
 /**
  * Converts PEM-formatted data into an certificate or key.
  *
@@ -3058,6 +3194,24 @@ pki.decryptRsaPrivateKey = function(pem, password) {
   // get EncryptedPrivateKeyInfo as ASN.1
   var rval = pki.encryptedPrivateKeyFromPem(pem);
   rval = pki.decryptPrivateKeyInfo(rval, password);
+  if(rval !== null) {
+    rval = pki.privateKeyFromAsn1(rval);
+  }
+  return rval;
+};
+
+/**
+ * Decrypts an OpenSSL RSA private key.
+ *
+ * @param pem the OpenSSL PEM-formatted private key to decrypt.
+ * @param password the password to use.
+ *
+ * @return the RSA key on success, null on failure.
+ */
+pki.decryptOpensslRsaPrivateKey = function(pem, password) {
+  // parse DER into asn.1 object
+  var rval = pki.opensslPemToDer(pem, password);
+  rval = asn1.fromDer(rval);
   if(rval !== null) {
     rval = pki.privateKeyFromAsn1(rval);
   }
